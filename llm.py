@@ -57,20 +57,39 @@ async def _chat_json(system: str, user_content: list[dict]) -> dict:
     }
     headers = {"Authorization": f"Bearer {config.LLM_API_KEY}"}
 
-    try:
-        timeout = aiohttp.ClientTimeout(total=90)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(url, json=payload, headers=headers,
-                                    proxy=config.PROXY_URL) as resp:
-                body = await resp.text()
-                if resp.status != 200:
+    # Retry transient 503 "high demand" errors a few times with backoff.
+    max_attempts = 3
+    delay = 2.0  # seconds
+    last_error: str | None = None
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            timeout = aiohttp.ClientTimeout(total=90)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(url, json=payload, headers=headers,
+                                        proxy=config.PROXY_URL) as resp:
+                    body = await resp.text()
+                    if resp.status == 200:
+                        break  # success, fall through to parsing
+                    if resp.status == 503:
+                        last_error = f"HTTP 503 (attempt {attempt}/{max_attempts})"
+                        log.warning("LLM returned 503, retrying in %.1fs", delay)
+                        await asyncio.sleep(delay)
+                        delay *= 2
+                        continue
+                    # Any other status: fail immediately.
                     raise LLMError(f"HTTP {resp.status}: {body[:300]}")
-    except (aiohttp.ClientError, TimeoutError) as e:
-        raise LLMError(f"Network error: {e!r}") from e
+        except (aiohttp.ClientError, TimeoutError) as e:
+            last_error = f"Network error: {e!r}"
+            log.warning("Network error on attempt %d, retrying in %.1fs", attempt, delay)
+            await asyncio.sleep(delay)
+            delay *= 2
+    else:
+        raise LLMError(f"LLM unavailable after {max_attempts} attempts: {last_error}")
 
     try:
         content = json.loads(body)["choices"][0]["message"]["content"]
-        content = re.sub(r"^\s*```(?:json)?\s*|\s*```\s*$", "", content)  # strip fences if any
+        content = re.sub(r"^\s*```(?:json)?\s*|\s*```\s*$", "", content)
         return json.loads(content)
     except (KeyError, IndexError, TypeError, json.JSONDecodeError) as e:
         raise LLMError(f"Malformed LLM response: {body[:300]}") from e
